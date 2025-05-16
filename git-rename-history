@@ -46,8 +46,11 @@ echo "--------------------------------------------------------------------------
 # Keep track of paths we've already processed to detect loops or end if path no longer exists
 declare -a rename_chain
 
-# Regex pattern for matching "rename {old => new}/path (similarity%)" lines
-REGEX_GIT_RENAME_LINE='^[[:space:]]*rename[[:space:]]+\{(.+)[[:space:]]+=>[[:space:]]+(.+)\}/(.+)[[:space:]]+\([0-9]+%\)$'
+# Regex patterns for matching rename lines in git diff-tree output
+# Pattern 1: Standard format for directory renames: "rename {old => new}/path (similarity%)"
+REGEX_GIT_RENAME_LINE_1='^[[:space:]]*rename[[:space:]]+\{(.+)[[:space:]]+=>[[:space:]]+(.+)\}/(.+)[[:space:]]+\([0-9]+%\)$'
+# Pattern 2: Format for nested directory renames: "rename dir/{old => new}/path (similarity%)"
+REGEX_GIT_RENAME_LINE_2='^[[:space:]]*rename[[:space:]]+(.+)/\{(.+)[[:space:]]+=>[[:space:]]+(.+)\}/(.+)[[:space:]]+\([0-9]+%\)$'
 
 # Loop as long as current_path_to_track is something we can trace
 while [ -n "$current_path_to_track" ]; do
@@ -90,7 +93,8 @@ while [ -n "$current_path_to_track" ]; do
     num_files_renamed_into_target=0
 
     while IFS= read -r line; do
-      if [[ "$line" =~ $REGEX_GIT_RENAME_LINE ]]; then
+      # Try to match pattern 1 (standard format)
+      if [[ "$line" =~ $REGEX_GIT_RENAME_LINE_1 ]]; then
         old_dir="${BASH_REMATCH[1]}"
         new_dir="${BASH_REMATCH[2]}"
         file_path="${BASH_REMATCH[3]}"
@@ -98,6 +102,42 @@ while [ -n "$current_path_to_track" ]; do
         # Normalize paths for consistent comparison
         normalized_old_dir=$(echo "$old_dir" | sed 's#^/*##;s#/*$##;s#^\.$##')
         normalized_new_dir=$(echo "$new_dir" | sed 's#^/*##;s#/*$##;s#^\.$##')
+        normalized_current_path=$(echo "$current_path_to_track" | sed 's#^/*##;s#/*$##')
+
+        # Check if this file was renamed into our target directory
+        if [[ "$normalized_new_dir" == "$normalized_current_path" ]] && [[ "$normalized_old_dir" != "$normalized_current_path" ]]; then
+          # --- Simulate associative array update ---
+          found_idx=-1
+          for i in "${!source_dir_names[@]}"; do
+            if [[ "${source_dir_names[$i]}" == "$normalized_old_dir" ]]; then
+              found_idx=$i
+              break
+            fi
+          done
+
+          if [[ $found_idx -ne -1 ]]; then
+            source_dir_counts[$found_idx]=$(( ${source_dir_counts[$found_idx]} + 1 ))
+          else
+            source_dir_names+=("$normalized_old_dir")
+            source_dir_counts+=(1)
+          fi
+          # --- End simulation update ---
+          num_files_renamed_into_target=$((num_files_renamed_into_target + 1))
+        fi
+      # Try to match pattern 2 (nested directory format)
+      elif [[ "$line" =~ $REGEX_GIT_RENAME_LINE_2 ]]; then
+        parent_dir="${BASH_REMATCH[1]}"
+        old_dir="${BASH_REMATCH[2]}"
+        new_dir="${BASH_REMATCH[3]}"
+        file_path="${BASH_REMATCH[4]}"
+
+        # Construct full paths
+        full_old_dir="${parent_dir}/${old_dir}"
+        full_new_dir="${parent_dir}/${new_dir}"
+
+        # Normalize paths for consistent comparison
+        normalized_old_dir=$(echo "$full_old_dir" | sed 's#^/*##;s#/*$##;s#^\.$##')
+        normalized_new_dir=$(echo "$full_new_dir" | sed 's#^/*##;s#/*$##;s#^\.$##')
         normalized_current_path=$(echo "$current_path_to_track" | sed 's#^/*##;s#/*$##')
 
         # Check if this file was renamed into our target directory
