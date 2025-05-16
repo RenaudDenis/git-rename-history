@@ -1,0 +1,177 @@
+#!/bin/bash
+
+# Script to attempt to trace directory rename/move history in Git.
+# This is a heuristic approach and may not catch all complex scenarios.
+# It is non-destructive and only reads Git history.
+#
+# Version 4: Replaced associative array with two indexed arrays for Bash 3.x compatibility.
+
+set -uo pipefail # Exit on unset variables, error in pipes
+
+if [ -z "$1" ]; then
+  echo "Usage: $0 <current_path_to_directory_relative_to_repo_root>"
+  echo "Example: $0 src/my_module"
+  exit 1
+fi
+
+# --- Configuration ---
+# Similarity threshold for rename detection (e.g., 70% for -M70%)
+RENAME_SIMILARITY_THRESHOLD="70%"
+# Minimum number of files that must be renamed from a common old directory
+# to consider it a directory rename event.
+# Set to 1 to detect directory renames even when only one file is renamed.
+MIN_FILES_FOR_DIR_RENAME=1
+# ---------------------
+
+
+# Ensure we are in a git repository
+if ! git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
+  echo "Error: Not inside a Git working tree."
+  exit 1
+fi
+
+initial_path_to_track="$1"
+# Normalize: remove leading/trailing slashes for consistency, handle "."
+current_path_to_track=$(echo "$initial_path_to_track" | sed 's#^/*##;s#/*$##')
+if [ "$current_path_to_track" == "." ] || [ -z "$current_path_to_track" ]; then
+    echo "Info: Tracking the root directory's rename history is not what this script is designed for."
+    echo "If the entire project was moved into a subdirectory, git filter-repo handles that history rewrite."
+    exit 0
+fi
+
+echo "Attempting to trace rename history for directory: '$current_path_to_track'"
+echo "Format: CommitHash: OldDirectoryPath -> NewDirectoryPath (based on ~${MIN_FILES_FOR_DIR_RENAME}+ file renames at ${RENAME_SIMILARITY_THRESHOLD} similarity)"
+echo "-----------------------------------------------------------------------------------------------------"
+
+# Keep track of paths we've already processed to detect loops or end if path no longer exists
+declare -a rename_chain
+
+# Regex pattern for matching "rename {old => new}/path (similarity%)" lines
+REGEX_GIT_RENAME_LINE='^[[:space:]]*rename[[:space:]]+\{(.+)[[:space:]]+=>[[:space:]]+(.+)\}/(.+)[[:space:]]+\([0-9]+%\)$'
+
+# Loop as long as current_path_to_track is something we can trace
+while [ -n "$current_path_to_track" ]; do
+  found_rename_source_in_iteration=""
+
+  commit_list_affecting_path=$(git rev-list HEAD -- "$current_path_to_track" 2>/dev/null)
+
+  if [ -z "$commit_list_affecting_path" ]; then
+    if ! git ls-tree HEAD:"$current_path_to_track" > /dev/null 2>&1 && [ ${#rename_chain[@]} -eq 0 ]; then
+        echo "Info: Directory '$initial_path_to_track' (currently '$current_path_to_track') does not appear to exist in HEAD, or no commits affected it."
+    elif [ ${#rename_chain[@]} -eq 0 ]; then
+        echo "Info: No rename history detected for '$current_path_to_track'. It might have been created at this path."
+    else
+        echo "Info: Traced history back to '$current_path_to_track'. This might be its original path or history predates rename detection."
+    fi
+    break
+  fi
+
+  for commit_hash in $commit_list_affecting_path; do
+    is_processed_commit=false
+    if [ "${#rename_chain[@]}" -gt 0 ]; then
+        for processed_entry in "${rename_chain[@]}"; do
+            if [[ "$processed_entry" == "$commit_hash:"* ]]; then
+                is_processed_commit=true
+                break
+            fi
+        done
+    fi
+
+    if $is_processed_commit; then
+        continue
+    fi
+
+    diff_summary=$(git diff-tree -r --summary "-M${RENAME_SIMILARITY_THRESHOLD}" --no-commit-id "$commit_hash^!" 2>/dev/null || continue)
+
+    # --- Simulate associative array for Bash 3.x ---
+    source_dir_names=()
+    source_dir_counts=()
+    # --- End simulation init ---
+    num_files_renamed_into_target=0
+
+    while IFS= read -r line; do
+      if [[ "$line" =~ $REGEX_GIT_RENAME_LINE ]]; then
+        old_dir="${BASH_REMATCH[1]}"
+        new_dir="${BASH_REMATCH[2]}"
+        file_path="${BASH_REMATCH[3]}"
+
+        # Normalize paths for consistent comparison
+        normalized_old_dir=$(echo "$old_dir" | sed 's#^/*##;s#/*$##;s#^\.$##')
+        normalized_new_dir=$(echo "$new_dir" | sed 's#^/*##;s#/*$##;s#^\.$##')
+        normalized_current_path=$(echo "$current_path_to_track" | sed 's#^/*##;s#/*$##')
+
+        # Check if this file was renamed into our target directory
+        if [[ "$normalized_new_dir" == "$normalized_current_path" ]] && [[ "$normalized_old_dir" != "$normalized_current_path" ]]; then
+          # --- Simulate associative array update ---
+          found_idx=-1
+          for i in "${!source_dir_names[@]}"; do
+            if [[ "${source_dir_names[$i]}" == "$normalized_old_dir" ]]; then
+              found_idx=$i
+              break
+            fi
+          done
+
+          if [[ $found_idx -ne -1 ]]; then
+            source_dir_counts[$found_idx]=$(( ${source_dir_counts[$found_idx]} + 1 ))
+          else
+            source_dir_names+=("$normalized_old_dir")
+            source_dir_counts+=(1)
+          fi
+          # --- End simulation update ---
+          num_files_renamed_into_target=$((num_files_renamed_into_target + 1))
+        fi
+      fi
+    done <<< "$diff_summary"
+
+    if [ "$num_files_renamed_into_target" -ge "$MIN_FILES_FOR_DIR_RENAME" ]; then
+      best_source_dir=""
+      max_files_from_source=0
+      # --- Simulate associative array iteration ---
+      for i in "${!source_dir_counts[@]}"; do # Iterate over indices of counts array
+        if [[ "${source_dir_counts[$i]}" -gt "$max_files_from_source" ]]; then
+          max_files_from_source="${source_dir_counts[$i]}"
+          best_source_dir="${source_dir_names[$i]}" # Get corresponding name
+        fi
+      done
+      # --- End simulation iteration ---
+
+      if [ -n "$best_source_dir" ] && [ "$max_files_from_source" -ge "$MIN_FILES_FOR_DIR_RENAME" ]; then
+        echo "$commit_hash: '$best_source_dir' -> '$current_path_to_track'"
+        rename_chain+=("$commit_hash: '$best_source_dir' -> '$current_path_to_track'")
+        found_rename_source_in_iteration="$best_source_dir"
+        break
+      fi
+    fi
+  done
+
+  if [ -n "$found_rename_source_in_iteration" ]; then
+    current_path_to_track="$found_rename_source_in_iteration"
+
+    if [[ "${#rename_chain[@]}" -gt 1 ]]; then
+        last_event="${rename_chain[${#rename_chain[@]}-1]}"
+        second_last_event="${rename_chain[${#rename_chain[@]}-2]}"
+
+        last_event_source_check=$(echo "$last_event" | sed -n "s/^[^:]*: '\(.*\)' -> '.*/\1/p")
+        last_event_target_check=$(echo "$last_event" | sed -n "s/^[^:]*: '.*' -> '\(.*\)'/\1/p")
+
+        second_last_event_source_check=$(echo "$second_last_event" | sed -n "s/^[^:]*: '\(.*\)' -> '.*/\1/p")
+        second_last_event_target_check=$(echo "$second_last_event" | sed -n "s/^[^:]*: '.*' -> '\(.*\)'/\1/p")
+
+        if [[ "$current_path_to_track" == "$second_last_event_target_check" ]] && \
+           [[ "$last_event_target_check" == "$second_last_event_source_check" ]]; then
+            echo "Info: Detected a potential rename loop involving '$current_path_to_track' and '$last_event_target_check'. Stopping trace here."
+            current_path_to_track=""
+        fi
+    fi
+  else
+    if [ ${#rename_chain[@]} -eq 0 ] && git ls-tree HEAD:"$current_path_to_track" > /dev/null 2>&1; then
+         echo "Info: No rename history found for '$initial_path_to_track' (ending at '$current_path_to_track'). It might be its original path."
+    elif [ ${#rename_chain[@]} -gt 0 ]; then
+         echo "Info: Traced history back to '$current_path_to_track'. This may be its original path or earlier renames were not detected."
+    fi
+    break
+  fi
+done
+
+echo "-----------------------------------------------------------------------------------------------------"
+echo "Done. Note: This script uses heuristics. Complex histories (e.g., merges, splits, very gradual moves) might not be fully represented."
